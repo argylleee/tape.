@@ -11,6 +11,7 @@ const xss = require('xss-clean');
 const hpp = require('hpp');
 const nodemailer = require('nodemailer');
 const axios = require('axios');
+const crypto = require('crypto');
 require('dotenv').config({ path: __dirname + '/.env' });
 
 const app = express();
@@ -490,6 +491,45 @@ async function verifyHcaptcha(token) {
   }
 }
 
+// Check NOTE_ENCRYPTION_KEY validity at startup
+if (!process.env.NOTE_ENCRYPTION_KEY || process.env.NOTE_ENCRYPTION_KEY.length !== 64) {
+  console.error('FATAL: NOTE_ENCRYPTION_KEY is missing or not 64 characters long!');
+  console.error('Current value:', process.env.NOTE_ENCRYPTION_KEY);
+  process.exit(1);
+} else {
+  console.log('NOTE_ENCRYPTION_KEY loaded, length:', process.env.NOTE_ENCRYPTION_KEY.length);
+}
+
+// AES-256-CBC encryption utilities for notes
+const NOTE_ENCRYPTION_KEY = process.env.NOTE_ENCRYPTION_KEY || 'ed32e980627b9e889cb9a15df88140e5e40bf66a8558e10b641510d26ba1d50f'; // 32 bytes fallback
+const ALGORITHM = 'aes-256-cbc';
+function encrypt(text) {
+  // Debug log for key value and length
+  console.log('ENCRYPT: NOTE_ENCRYPTION_KEY length:', NOTE_ENCRYPTION_KEY.length, 'value:', NOTE_ENCRYPTION_KEY);
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(ALGORITHM, Buffer.from(NOTE_ENCRYPTION_KEY, 'hex'), iv);
+  let encrypted = cipher.update(text, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+  return iv.toString('hex') + ':' + encrypted;
+}
+function decrypt(text) {
+  // If text is empty or not a string, return as is
+  if (!text || typeof text !== 'string') return text;
+  // If text does not contain a colon, treat as unencrypted
+  if (!text.includes(':')) return text;
+  try {
+    const [ivHex, encrypted] = text.split(':');
+    const iv = Buffer.from(ivHex, 'hex');
+    const decipher = crypto.createDecipheriv(ALGORITHM, Buffer.from(NOTE_ENCRYPTION_KEY, 'hex'), iv);
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+  } catch (e) {
+    // If decryption fails, return the original text
+    return text;
+  }
+}
+
 // Sign Up Endpoint
 app.post('/api/signup', validateSignup, async (req, res) => {
   console.log('=== BACKEND DEBUG ===');
@@ -723,86 +763,32 @@ app.post('/api/signin', validateSignin, signinLimiter, async (req, res) => {
 // Create a new note
 app.post('/api/notes', verifyToken, (req, res) => {
   const { user_id, title, description, content_html, tags } = req.body;
-  
-  // Verify that the user_id matches the authenticated user
   if (user_id !== req.user.id) {
-    console.error('User ID mismatch:', { provided: user_id, authenticated: req.user.id });
     return res.status(403).json({ message: 'Unauthorized to create note for this user' });
   }
-
-  // Sanitize and prepare the data
-  const sanitizedTitle = title ? title.toString().trim() : 'Untitled Note';
-  const sanitizedDescription = description ? description.toString().trim() : '';
-  const sanitizedContent = content_html ? content_html.toString().trim() : '';
-  const sanitizedTags = Array.isArray(tags) ? tags : [];
-
-  // If this is a checklist, ensure the checklist tag is present
-  if (sanitizedTags.includes('checklist')) {
-    const query = 'INSERT INTO notes (user_id, title, description, content_html, tags, created_at) VALUES (?, ?, ?, ?, ?, NOW())';
-    const values = [
+  // Encrypt only title, description, and content_html
+  const encTitle = encrypt(title ? title.toString().trim() : 'Untitled Note');
+  const encDescription = encrypt(description ? description.toString().trim() : '');
+  const encContent = encrypt(content_html ? content_html.toString().trim() : '');
+  const tagsJson = JSON.stringify(Array.isArray(tags) ? tags : []); // Do not encrypt tags
+  const query = 'INSERT INTO notes (user_id, title, description, content_html, tags, created_at) VALUES (?, ?, ?, ?, ?, NOW())';
+  const values = [user_id, encTitle, encDescription, encContent, tagsJson];
+  pool.query(query, values, (err, result) => {
+    if (err) {
+      console.error('Error creating note (SQL):', err);
+      return res.status(500).json({ message: 'Error creating note', sqlError: err.message });
+    }
+    res.status(201).json({
+      note_id: result.insertId,
       user_id,
-      sanitizedTitle,
-      sanitizedDescription,
-      sanitizedContent,
-      JSON.stringify(sanitizedTags)
-    ];
-
-    console.log('Creating note with values:', values);
-
-    pool.query(query, values, (err, result) => {
-      if (err) {
-        console.error('Error creating note:', err);
-        return res.status(500).json({ message: 'Error creating note' });
-      }
-
-      // Instead of making another query, construct the response directly
-      const newNote = {
-        note_id: result.insertId,
-        user_id: user_id,
-        title: sanitizedTitle,
-        description: sanitizedDescription,
-        content_html: sanitizedContent,
-        tags: sanitizedTags,
-        created_at: new Date().toISOString(),
-        modified_at: new Date().toISOString()
-      };
-
-      res.status(201).json(newNote);
+      title,
+      description,
+      content_html,
+      tags: Array.isArray(tags) ? tags : [],
+      created_at: new Date().toISOString(),
+      modified_at: new Date().toISOString()
     });
-  } else {
-    // Regular note creation
-    const query = 'INSERT INTO notes (user_id, title, description, content_html, tags, created_at) VALUES (?, ?, ?, ?, ?, NOW())';
-    const values = [
-      user_id,
-      sanitizedTitle,
-      sanitizedDescription,
-      sanitizedContent,
-      JSON.stringify(sanitizedTags)
-    ];
-
-    console.log('Creating note with values:', values);
-
-    pool.query(query, values, (err, result) => {
-      if (err) {
-        console.error('Error creating note:', err);
-        return res.status(500).json({ message: 'Error creating note' });
-      }
-
-      // Instead of making another query, construct the response directly
-      const newNote = {
-        note_id: result.insertId,
-        user_id: user_id,
-        title: sanitizedTitle,
-        description: sanitizedDescription,
-        content_html: sanitizedContent,
-        tags: sanitizedTags,
-        created_at: new Date().toISOString(),
-        modified_at: new Date().toISOString()
-      };
-
-      res.status(201).json(newNote);
-    });
-  }
+  });
 });
 
 // Fetch notes for a user with sorting and filtering
@@ -864,22 +850,18 @@ app.get('/api/users/:user_id/notes', verifyToken, (req, res) => {
 
     console.log('Query results:', results);
 
-    // Ensure tags is always an array
-    const safeResults = results.map(note => ({
-      ...note,
-      tags: Array.isArray(note.tags)
-        ? note.tags
-        : (typeof note.tags === 'string'
-            ? (() => { 
-                try { 
-                  return JSON.parse(note.tags); 
-                } catch (e) { 
-                  console.error('Error parsing tags:', e);
-                  return []; 
-                }
-              })()
-            : (note.tags === null || note.tags === undefined ? [] : note.tags))
-    }));
+    // Decrypt all fields
+    const safeResults = results.map(note => {
+      let tagsArr = [];
+      try { tagsArr = JSON.parse(decrypt(note.tags)); } catch (e) { tagsArr = []; }
+      return {
+        ...note,
+        title: decrypt(note.title),
+        description: decrypt(note.description),
+        content_html: decrypt(note.content_html),
+        tags: tagsArr
+      };
+    });
 
     console.log('Safe results:', safeResults);
     res.status(200).json({ notes: safeResults });
@@ -903,20 +885,17 @@ app.get('/api/notes/:note_id', verifyToken, (req, res) => {
         return res.status(404).json({ message: 'Note not found' });
       }
 
-      // Ensure tags is always an array
+      // Decrypt all fields
       const note = results[0];
-      try {
-        note.tags = Array.isArray(note.tags)
-          ? note.tags
-          : (typeof note.tags === 'string'
-              ? JSON.parse(note.tags)
-              : (note.tags === null || note.tags === undefined ? [] : note.tags));
-      } catch (e) {
-        console.error('Error parsing tags:', e);
-        note.tags = [];
-      }
-      
-      res.json(note);
+      let tagsArr = [];
+      try { tagsArr = JSON.parse(decrypt(note.tags)); } catch (e) { tagsArr = []; }
+      res.json({
+        ...note,
+        title: decrypt(note.title),
+        description: decrypt(note.description),
+        content_html: decrypt(note.content_html),
+        tags: tagsArr
+      });
     }
   );
 });
@@ -924,63 +903,37 @@ app.get('/api/notes/:note_id', verifyToken, (req, res) => {
 // Update a note
 app.put('/api/notes/:note_id', verifyToken, (req, res) => {
   const { note_id } = req.params;
-  const { title, content_html, tags } = req.body;
-  
-  // Ensure tags is an array
-  let safeTags = [];
-  try {
-    safeTags = Array.isArray(tags) ? tags : [];
-  } catch (e) {
-    console.error('Error processing tags:', e);
-    safeTags = [];
-  }
-  
-  const query = `
-    UPDATE notes 
-    SET title = ?, 
-        content_html = ?, 
-        tags = ?,
-        modified_at = NOW()
-    WHERE note_id = ?
-  `;
-  
-  pool.query(
-    query,
-    [title, content_html, JSON.stringify(safeTags), note_id],
-    (err, result) => {
-      if (err) {
-        console.error('Error updating note:', err);
-        return res.status(500).json({ message: 'Error updating note' });
-      }
-      
-      if (result.affectedRows === 0) {
-        return res.status(404).json({ message: 'Note not found' });
-      }
-      
-      // Fetch the updated note
-      pool.query('SELECT * FROM notes WHERE note_id = ?', [note_id], (err, results) => {
-        if (err) {
-          console.error('Error fetching updated note:', err);
-          return res.status(500).json({ message: 'Error fetching updated note' });
-        }
-        
-        // Ensure tags is always an array in the response
-        const note = results[0];
-        try {
-          note.tags = Array.isArray(note.tags)
-            ? note.tags
-            : (typeof note.tags === 'string'
-                ? JSON.parse(note.tags)
-                : (note.tags === null || note.tags === undefined ? [] : note.tags));
-        } catch (e) {
-          console.error('Error parsing tags:', e);
-          note.tags = safeTags;
-        }
-        
-        res.json(note);
-      });
+  const { title, content_html, tags, description } = req.body;
+  // Encrypt only title, description, and content_html
+  const encTitle = encrypt(title ? title.toString().trim() : 'Untitled Note');
+  const encDescription = encrypt(description ? description.toString().trim() : '');
+  const encContent = encrypt(content_html ? content_html.toString().trim() : '');
+  const tagsJson = JSON.stringify(Array.isArray(tags) ? tags : []); // Do not encrypt tags
+  const query = `UPDATE notes SET title = ?, description = ?, content_html = ?, tags = ?, modified_at = NOW() WHERE note_id = ?`;
+  pool.query(query, [encTitle, encDescription, encContent, tagsJson, note_id], (err, result) => {
+    if (err) {
+      return res.status(500).json({ message: 'Error updating note' });
     }
-  );
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: 'Note not found' });
+    }
+    // Fetch the updated note
+    pool.query('SELECT * FROM notes WHERE note_id = ?', [note_id], (err, results) => {
+      if (err) {
+        return res.status(500).json({ message: 'Error fetching updated note' });
+      }
+      const note = results[0];
+      let tagsArr = [];
+      try { tagsArr = JSON.parse(decrypt(note.tags)); } catch (e) { tagsArr = []; }
+      res.json({
+        ...note,
+        title: decrypt(note.title),
+        description: decrypt(note.description),
+        content_html: decrypt(note.content_html),
+        tags: tagsArr
+      });
+    });
+  });
 });
 
 // Delete a note
@@ -1024,35 +977,31 @@ app.get('/api/users/:user_id', verifyToken, (req, res) => {
 // Checklist endpoints
 app.post('/api/checklists', verifyToken, async (req, res) => {
   const { note_id, title, items, user_id } = req.body;
-  
-  // Verify that the user_id matches the authenticated user
   if (user_id !== req.user.id) {
     console.error('User ID mismatch:', { provided: user_id, authenticated: req.user.id });
     return res.status(403).json({ message: 'Unauthorized to create checklist for this user' });
   }
-  
   try {
+    // Encrypt checklist title
+    const encTitle = encrypt(title ? title.toString().trim() : 'Untitled Checklist');
     // Create checklist
     const checklistQuery = 'INSERT INTO checklists (note_id, title) VALUES (?, ?)';
-    pool.query(checklistQuery, [note_id, title], (err, result) => {
+    pool.query(checklistQuery, [note_id, encTitle], (err, result) => {
       if (err) {
         console.error('Error creating checklist:', err);
         return res.status(500).json({ success: false, message: 'Error creating checklist' });
       }
-
       const checklistId = result.insertId;
-
       // Create checklist items
       if (items && items.length > 0) {
-        const itemValues = items.map(item => [checklistId, item.content, item.is_completed || false]);
+        // Encrypt item content
+        const itemValues = items.map(item => [checklistId, encrypt(item.content), item.is_completed || false]);
         const itemsQuery = 'INSERT INTO checklist_items (checklist_id, content, is_completed) VALUES ?';
-        
-        pool.query(itemsQuery, [itemValues], (err) => {
+        pool.query(itemsQuery, [itemValues], (err, result) => {
           if (err) {
-            console.error('Error creating checklist items:', err);
-            return res.status(500).json({ success: false, message: 'Error creating checklist items' });
+            console.error('Error creating checklist items:', err, 'itemValues:', itemValues);
+            return res.status(500).json({ success: false, message: 'Error creating checklist items', sqlError: err.message });
           }
-          
           // Fetch the created checklist with items
           const getChecklistQuery = `
             SELECT c.*, 
@@ -1070,20 +1019,21 @@ app.post('/api/checklists', verifyToken, async (req, res) => {
             WHERE c.id = ?
             GROUP BY c.id
           `;
-
           pool.query(getChecklistQuery, [checklistId], (err, results) => {
             if (err) {
               console.error('Error fetching created checklist:', err);
               return res.status(500).json({ success: false, message: 'Error fetching created checklist' });
             }
-
             const checklist = results[0];
             try {
-              checklist.items = JSON.parse(checklist.items);
+              checklist.title = decrypt(checklist.title);
+              checklist.items = JSON.parse(checklist.items).map(item => ({
+                ...item,
+                content: decrypt(item.content)
+              }));
             } catch (e) {
               checklist.items = [];
             }
-
             res.status(201).json({ 
               success: true, 
               message: 'Checklist created successfully',
@@ -1092,7 +1042,6 @@ app.post('/api/checklists', verifyToken, async (req, res) => {
           });
         });
       } else {
-        // No items to insert, just return the checklist
         res.status(201).json({ 
           success: true, 
           message: 'Checklist created successfully',
@@ -1113,7 +1062,6 @@ app.post('/api/checklists', verifyToken, async (req, res) => {
 
 app.get('/api/checklists/:noteId', verifyToken, async (req, res) => {
   const { noteId } = req.params;
-  
   try {
     const query = `
       SELECT c.*, 
@@ -1131,25 +1079,24 @@ app.get('/api/checklists/:noteId', verifyToken, async (req, res) => {
       WHERE c.note_id = ?
       GROUP BY c.id
     `;
-
     pool.query(query, [noteId], (err, results) => {
       if (err) {
         console.error('Error fetching checklist:', err);
         return res.status(500).json({ message: 'Error fetching checklist' });
       }
-
       if (results.length === 0) {
         return res.status(404).json({ message: 'Checklist not found' });
       }
-
-      // Parse the items JSON string
       const checklist = results[0];
       try {
-        checklist.items = JSON.parse(checklist.items);
+        checklist.title = decrypt(checklist.title);
+        checklist.items = JSON.parse(checklist.items).map(item => ({
+          ...item,
+          content: decrypt(item.content)
+        }));
       } catch (e) {
         checklist.items = [];
       }
-
       res.json(checklist);
     });
   } catch (error) {
@@ -1164,21 +1111,17 @@ app.put('/api/checklists/:noteId', verifyToken, async (req, res) => {
   const { title, items } = req.body;
   console.log('PUT /api/checklists/:noteId', { noteId, title, items });
   try {
-    // Start a transaction
     pool.getConnection((err, connection) => {
       if (err) {
         console.error('Error getting connection:', err);
         return res.status(500).json({ message: 'Database error' });
       }
-
       connection.beginTransaction(err => {
         if (err) {
           connection.release();
           console.error('Error starting transaction:', err);
           return res.status(500).json({ message: 'Database error' });
         }
-
-        // First get the checklist ID
         const getChecklistQuery = 'SELECT id FROM checklists WHERE note_id = ?';
         connection.query(getChecklistQuery, [noteId], (err, results) => {
           if (err) {
@@ -1188,7 +1131,6 @@ app.put('/api/checklists/:noteId', verifyToken, async (req, res) => {
               return res.status(500).json({ message: 'Error getting checklist' });
             });
           }
-
           if (results.length === 0) {
             console.error('Checklist not found for noteId:', noteId);
             return connection.rollback(() => {
@@ -1196,13 +1138,12 @@ app.put('/api/checklists/:noteId', verifyToken, async (req, res) => {
               return res.status(404).json({ message: 'Checklist not found' });
             });
           }
-
           const checklistId = results[0].id;
           console.log('Found checklistId:', checklistId);
-
-          // Update checklist title
+          // Encrypt checklist title
+          const encTitle = encrypt(title ? title.toString().trim() : 'Untitled Checklist');
           const updateChecklistQuery = 'UPDATE checklists SET title = ? WHERE id = ?';
-          connection.query(updateChecklistQuery, [title, checklistId], (err) => {
+          connection.query(updateChecklistQuery, [encTitle, checklistId], (err) => {
             if (err) {
               console.error('Error updating checklist:', err);
               return connection.rollback(() => {
@@ -1210,8 +1151,6 @@ app.put('/api/checklists/:noteId', verifyToken, async (req, res) => {
                 return res.status(500).json({ message: 'Error updating checklist' });
               });
             }
-
-            // Delete existing items
             const deleteItemsQuery = 'DELETE FROM checklist_items WHERE checklist_id = ?';
             connection.query(deleteItemsQuery, [checklistId], (err) => {
               if (err) {
@@ -1221,10 +1160,9 @@ app.put('/api/checklists/:noteId', verifyToken, async (req, res) => {
                   return res.status(500).json({ message: 'Error updating checklist items' });
                 });
               }
-
-              // Insert new items
               if (items && items.length > 0) {
-                const itemValues = items.map(item => [checklistId, item.content, item.is_completed || false]);
+                // Encrypt item content
+                const itemValues = items.map(item => [checklistId, encrypt(item.content), item.is_completed || false]);
                 const insertItemsQuery = 'INSERT INTO checklist_items (checklist_id, content, is_completed) VALUES ?';
                 console.log('Inserting items:', itemValues);
                 connection.query(insertItemsQuery, [itemValues], (err, insertResult) => {
@@ -1236,7 +1174,6 @@ app.put('/api/checklists/:noteId', verifyToken, async (req, res) => {
                     });
                   }
                   console.log('Inserted items result:', insertResult);
-                  // Commit the transaction
                   connection.commit(err => {
                     if (err) {
                       console.error('Error committing transaction:', err);
@@ -1245,8 +1182,6 @@ app.put('/api/checklists/:noteId', verifyToken, async (req, res) => {
                         return res.status(500).json({ message: 'Database error' });
                       });
                     }
-
-                    // Fetch the updated checklist with items
                     const getUpdatedChecklistQuery = `
                       SELECT c.*, 
                         JSON_ARRAYAGG(
@@ -1263,21 +1198,22 @@ app.put('/api/checklists/:noteId', verifyToken, async (req, res) => {
                       WHERE c.id = ?
                       GROUP BY c.id
                     `;
-
                     connection.query(getUpdatedChecklistQuery, [checklistId], (err, results) => {
                       if (err) {
                         console.error('Error fetching updated checklist:', err);
                         connection.release();
                         return res.status(500).json({ message: 'Error fetching updated checklist' });
                       }
-
                       const updatedChecklist = results[0];
                       try {
-                        updatedChecklist.items = JSON.parse(updatedChecklist.items);
+                        updatedChecklist.title = decrypt(updatedChecklist.title);
+                        updatedChecklist.items = JSON.parse(updatedChecklist.items).map(item => ({
+                          ...item,
+                          content: decrypt(item.content)
+                        }));
                       } catch (e) {
                         updatedChecklist.items = [];
                       }
-
                       connection.release();
                       res.json({ 
                         success: true, 
@@ -1288,7 +1224,6 @@ app.put('/api/checklists/:noteId', verifyToken, async (req, res) => {
                   });
                 });
               } else {
-                // No items to insert, just commit
                 connection.commit(err => {
                   if (err) {
                     console.error('Error committing transaction:', err);
@@ -1297,7 +1232,6 @@ app.put('/api/checklists/:noteId', verifyToken, async (req, res) => {
                       return res.status(500).json({ message: 'Database error' });
                     });
                   }
-
                   connection.release();
                   res.json({ 
                     success: true, 
@@ -1497,6 +1431,59 @@ app.get('/api/debug/rate-limit-status', (req, res) => {
       });
     });
   });
+});
+
+// Change Password Endpoint
+app.post('/api/change-password', verifyToken, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  const userId = req.user.id;
+
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ message: 'All fields are required.' });
+  }
+
+  // Get user from DB
+  pool.query('SELECT password FROM users WHERE id = ?', [userId], async (err, results) => {
+    if (err) return res.status(500).json({ message: 'Database error.' });
+    if (results.length === 0) return res.status(404).json({ message: 'User not found.' });
+
+    const user = results[0];
+    const isMatch = await bcrypt.compare(currentPassword, user.password);
+    if (!isMatch) return res.status(400).json({ message: 'Current password is incorrect.' });
+
+    // Check if new password is the same as current
+    const isSame = await bcrypt.compare(newPassword, user.password);
+    if (isSame) return res.status(400).json({ message: 'New password must be different from the current password.' });
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    pool.query('UPDATE users SET password = ? WHERE id = ?', [hashedPassword, userId], (err) => {
+      if (err) return res.status(500).json({ message: 'Failed to update password.' });
+      res.json({ message: 'Password updated successfully.' });
+    });
+  });
+});
+
+// Global error handling middleware (should be placed after all routes)
+app.use((err, req, res, next) => {
+  console.error('Global error handler:', err.stack || err);
+  res.status(500).json({
+    success: false,
+    message: 'Internal server error',
+    error: process.env.NODE_ENV === 'development' ? (err.stack || err.message) : undefined
+  });
+});
+
+// Catch unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  // Optionally, log to a file or external service
+});
+
+// Catch uncaught exceptions
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception thrown:', err);
+  // Optionally, log to a file or external service
+  // Do not exit the process automatically
 });
 
 // Start the server
